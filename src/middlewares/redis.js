@@ -1,8 +1,11 @@
 const { createClient } = require("redis");
+const zlib = require("zlib");
 const hash = require("object-hash");
+
 
 // initialize the Redis client variable
 let redisClient = undefined;
+
 
 async function initializeRedisClient() {
   // read the Redis connection URL from the envs
@@ -13,6 +16,7 @@ async function initializeRedisClient() {
       console.error(`Failed to create the Redis client with error:`);
       console.error(e);
     });
+
 
     try {
       // connect to the Redis server
@@ -25,6 +29,7 @@ async function initializeRedisClient() {
   }
 }
 
+
 function requestToKey(req) {
   // build a custom object to use as part of the Redis key
   const reqDataToHash = {
@@ -32,10 +37,12 @@ function requestToKey(req) {
     body: req.body,
   };
 
+
   // `${req.path}@...` to make it easier to find
   // keys on a Redis client
   return `${req.path}@${hash.sha1(reqDataToHash)}`;
 }
+
 
 function isRedisWorking() {
   // verify wheter there is an active connection
@@ -43,37 +50,57 @@ function isRedisWorking() {
   return !!redisClient?.isOpen;
 }
 
-async function writeData(key, data, options) {
+
+async function writeData(key, data, options, compress) {
   if (isRedisWorking()) {
+    let dataToCache = data;
+    if (compress) {
+      // compress the value with ZLIB to save RAM
+      dataToCache = zlib.deflateSync(data).toString("base64");
+    }
+
+
     try {
       // write data to the Redis cache
-      await redisClient.set(key, data, options);
+      await redisClient.set(key, dataToCache, options);
     } catch (e) {
       console.error(`Failed to cache data for key=${key}`, e);
     }
   }
 }
 
-async function readData(key) {
+
+async function readData(key, compressed) {
   let cachedValue = undefined;
   if (isRedisWorking()) {
     // try to get the cached response from redis
-    return await redisClient.get(key);
+    cachedValue = await redisClient.get(key);
+    if (cachedValue) {
+      if (compressed) {
+        // decompress the cached value with ZLIB
+        return zlib.inflateSync(Buffer.from(cachedValue, "base64")).toString();
+      } else {
+        return cachedValue;
+      }
+    }
   }
+
 
   return cachedValue;
 }
 
+
 function redisCachingMiddleware(
   options = {
     EX: 21600, // 6h
-  }
+  },
+  compression = true
 ) {
   return async (req, res, next) => {
     if (isRedisWorking()) {
       const key = requestToKey(req);
       // if there is some cached data, retrieve it and return it
-      const cachedValue = await readData(key);
+      const cachedValue = await readData(key, compression);
       if (cachedValue) {
         try {
           // if it is JSON data, then return it
@@ -90,13 +117,16 @@ function redisCachingMiddleware(
           // set the function back to avoid the 'double-send' effect
           res.send = oldSend;
 
+
           // cache the response only if it is successful
           if (res.statusCode.toString().startsWith("2")) {
-            writeData(key, data, options).then();
+            writeData(key, data, options, compression).then();
           }
+
 
           return res.send(data);
         };
+
 
         // continue to the controller function
         next();
@@ -107,5 +137,6 @@ function redisCachingMiddleware(
     }
   };
 }
+
 
 module.exports = { initializeRedisClient, redisCachingMiddleware };
